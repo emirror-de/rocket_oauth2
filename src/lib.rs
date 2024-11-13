@@ -525,7 +525,7 @@ impl<'r, K: 'static> FromRequest<'r> for TokenResponse<K> {
                     return Outcome::Error((
                         Status::BadRequest,
                         Error::new_from(
-                            ErrorKind::ExchangeFailure,
+                            ErrorKind::InvalidGrant,
                             "The OAuth2 code verifier returned from the server did not match the stored code challenge.",
                         ),
                     ));

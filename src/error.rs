@@ -8,6 +8,8 @@ pub enum ErrorKind {
     /// An error occurred during URI parsing or construction. This usually means
     /// the token exchange endpoint is incorrect. The attempted URI is included.
     InvalidUri(String),
+    /// `code_verifier` did not match the `code_challenge`.
+    InvalidGrant,
     /// A token exchange request failed, for example because the server could
     /// not be reached, or the response body could not be parsed.
     ExchangeFailure,
@@ -54,6 +56,7 @@ impl Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match &self.kind {
             ErrorKind::InvalidUri(uri) => write!(f, "invalid URI: '{}'", uri)?,
+            ErrorKind::InvalidGrant => write!(f, "invalid code verifier")?,
             ErrorKind::ExchangeFailure => write!(f, "failed to exchange token")?,
             ErrorKind::ExchangeError(code) => write!(
                 f,
