@@ -143,6 +143,7 @@ pub mod query;
 mod hyper_rustls_adapter;
 #[cfg(feature = "hyper_rustls_adapter")]
 pub use hyper_rustls_adapter::HyperRustlsAdapter;
+use sha2::Sha256;
 
 pub use self::config::*;
 pub use self::error::*;
@@ -164,6 +165,11 @@ use serde_json::Value;
 
 const STATE_COOKIE_NAME: &str = "rocket_oauth2_state";
 
+// PKCE EXTENSION VALUES
+const CODE_CHALLENGE_COOKIE_NAME: &str = "rocket_oauth2_code_challenge";
+const CODE_CHALLENGE_ALLOWED_CHARACTERS: &str =
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~";
+
 // Random generation of state for defense against CSRF.
 // See RFC 6749 §10.12 for more details.
 fn generate_state(rng: &mut impl rand::RngCore) -> Result<String, Error> {
@@ -175,6 +181,24 @@ fn generate_state(rng: &mut impl rand::RngCore) -> Result<String, Error> {
         )
     })?;
     Ok(BASE64_URL_SAFE_NO_PAD.encode(&buf))
+}
+
+/// Random generation of a `code_challenge` specified by the
+/// [`PKCE`](https://oauth.net/2/pkce/) extension of OAuth2.
+fn generate_code_challenge(rng: &mut impl rand::RngCore) -> Result<String, Error> {
+    let challenge_length = 128;
+    let mut code_challenge = String::with_capacity(challenge_length);
+    let allowed_charset_length = CODE_CHALLENGE_ALLOWED_CHARACTERS.len();
+    for char in 0..challenge_length {
+        let random_char = rng.gen_range(0..allowed_charset_length);
+        code_challenge[char] = random_char;
+    }
+    // or just use:
+    // random_string::generate(128, random_string::charsets::ALPHANUMERIC + "-._~");
+    let mut hasher = Sha256::new();
+    hasher.update(code_challenge.as_bytes());
+    let code_challenge = hasher.finalize();
+    Ok(BASE64_URL_SAFE_NO_PAD.encode(&code_challenge))
 }
 
 /// The token types which can be exchanged with the token endpoint
@@ -444,6 +468,7 @@ impl<'r, K: 'static> FromRequest<'r> for TokenResponse<K> {
             state: String,
             // Nonstandard (but see below)
             scope: Option<String>,
+            code_verifier: String,
         }
 
         let params = match Form::<CallbackQuery>::parse_encoded(&query) {
@@ -480,6 +505,28 @@ impl<'r, K: 'static> FromRequest<'r> for TokenResponse<K> {
                         Error::new_from(
                             ErrorKind::ExchangeFailure,
                             "The OAuth2 state returned from the server did match the stored state.",
+                        ),
+                    ));
+                }
+            }
+
+            // PKCE challenge verification.
+            match cookies.get_private(CODE_CHALLENGE_COOKIE_NAME) {
+                Some(ref cookie) if cookie.value() == params.code_verifier => {
+                    cookies.remove(cookie.clone());
+                }
+                other => {
+                    if other.is_some() {
+                        warn!("The OAuth2 PKCE challenge returned from the server did not match the stored one.");
+                    } else {
+                        error!("The OAuth2 PKCE challenge cookie was missing. It may have been blocked by the client?");
+                    }
+
+                    return Outcome::Error((
+                        Status::BadRequest,
+                        Error::new_from(
+                            ErrorKind::ExchangeFailure,
+                            "The OAuth2 code verifier returned from the server did not match the stored code challenge.",
                         ),
                     ));
                 }
@@ -691,13 +738,31 @@ impl<K: 'static> OAuth2<K> {
         scopes: &[&str],
         extras: &[(&str, &str)],
     ) -> Result<Redirect, Error> {
-        let state = generate_state(&mut rand::thread_rng())?;
-        let uri = self
-            .0
-            .adapter
-            .authorization_uri(&self.0.config, &state, scopes, extras)?;
+        let mut rng = rand::thread_rng();
+        let state = generate_state(&mut rng)?;
+        let code_challenge = generate_code_challenge(&mut rng)?;
+        let extras = [
+            extras,
+            [
+                (query::param::CODE_CHALLENGE, code_challenge),
+                (
+                    query::param::CODE_CHALLENGE_METHOD,
+                    query::param::code_challenge_method::S256.to_string(),
+                ),
+            ],
+        ]
+        .concat();
+        let uri =
+            self.0
+                .adapter
+                .authorization_uri(&self.0.config, &state, scopes, extras.as_slice())?;
         cookies.add_private(
             Cookie::build((STATE_COOKIE_NAME, state))
+                .same_site(SameSite::Lax)
+                .build(),
+        );
+        cookies.add_private(
+            Cookie::build((CODE_CHALLENGE_COOKIE_NAME, code_challenge))
                 .same_site(SameSite::Lax)
                 .build(),
         );
